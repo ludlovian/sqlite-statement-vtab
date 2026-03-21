@@ -12,6 +12,53 @@ SQLITE_EXTENSION_INIT1
 #include <stdint.h>
 #include <limits.h>
 
+/*
+ * This has been modified to cache prepared statements per vTab rather than
+ * preparing in xOpen and finalizing in xClose.
+ *
+ * An additional API is available to clear the cache for a connection
+ * prior to closing it. Although *probably* just calling sqlite3_close_v2
+ * means this would still be okay without this, people should really
+ * clean up their own mess.
+ *
+ *     void statementvtab_clear_cache(sqlite*)
+ *
+ * These change only appear if the code is compiled with CACHE_STATEMENTS
+ *
+ * This additional logic is not re-entrant. There are no mutexes.
+ * Either use in single threads, or apply synchronisation outside.
+ */
+
+#ifdef CACHE_STATEMENTS
+
+#define DEBUG 0
+#if DEBUG
+	#define DEBUG_LOG(fmt, ...) printf("[STMT] " fmt "\n", ##__VA_ARGS__)
+#else
+	#define DEBUG_LOG(fmt, ...) ((void)0)
+#endif
+
+/* forward typedefs of structures */
+typedef struct stmt_cache_node stmt_cache_node;
+typedef struct statement_vtab statement_vtab;
+
+/*
+ * The cache is a linked list of these nodes
+ */
+struct stmt_cache_node {
+	sqlite3_stmt *stmt;
+	int in_use;
+	stmt_cache_node *next;
+};
+
+/*
+ * A global linked list of vtabs
+ */
+
+static statement_vtab *g_vtab_list = NULL;
+
+#endif /* CACHE_STATEMENTS */
+
 struct statement_vtab {
 	sqlite3_vtab base;
 	sqlite3* db;
@@ -19,6 +66,12 @@ struct statement_vtab {
 	size_t sql_len;
 	int num_inputs;
 	int num_outputs;
+#ifdef CACHE_STATEMENTS
+	/* Each vtab has a cache of statements */
+	stmt_cache_node *cache_head;
+	/* Each vtab links to the next */
+	statement_vtab *next_vtab;
+#endif
 };
 
 struct statement_cursor {
@@ -27,7 +80,108 @@ struct statement_cursor {
 	int rowid;
 	int param_argc;
 	sqlite3_value** param_argv;
+#ifdef CACHE_STATEMENTS
+	/* Each cursor will have checked out one of the cached statements */
+	stmt_cache_node *node;
+#endif
 };
+
+#ifdef CACHE_STATEMENTS
+
+static void add_vtab_to_global_list(statement_vtab *vtab) {
+	DEBUG_LOG("Add vtab %p", vtab);
+	vtab->next_vtab = g_vtab_list;
+	g_vtab_list = vtab;
+}
+
+static void remove_vtab_from_global_list(statement_vtab *vtab) {
+	DEBUG_LOG("Remove vtab %p", vtab);
+	statement_vtab **pp;
+	for (pp = &g_vtab_list; *pp; pp = &((*pp)->next_vtab)) {
+		if (*pp == vtab) {
+			*pp = vtab->next_vtab;
+			break;
+		}
+	}
+}
+
+static void clear_vtab_cache(statement_vtab *vtab) {
+	if (vtab->cache_head) {
+		DEBUG_LOG("Clear vtab cache %p", vtab);
+		stmt_cache_node* node = vtab->cache_head;
+		while (node) {
+			stmt_cache_node *next = node->next;
+			DEBUG_LOG("free node %p", node);
+			if (node->stmt) sqlite3_finalize(node->stmt);
+			sqlite3_free(node);
+			node = next;
+		}
+		vtab->cache_head = NULL;
+	}
+}
+
+/* The meat of the work. We fetch an existing unused statement from the
+ * cache if we have one. If not, then we prepare a new statement and
+ * add it to the cache
+ */
+
+static int get_or_create_node(statement_vtab *vtab, stmt_cache_node **pNode) {
+	stmt_cache_node *node = vtab->cache_head;
+	while (node) {
+		if (!node->in_use) {
+			node->in_use = 1;
+			*pNode = node;
+			DEBUG_LOG("Reuse node %p", node);
+			return SQLITE_OK;
+		}
+		node = node->next;
+	}
+
+	node = sqlite3_malloc64(sizeof(*node));
+	if (!node) return SQLITE_NOMEM;
+
+	int rc = sqlite3_prepare_v3(vtab->db, vtab->sql, vtab->sql_len, 
+								SQLITE_PREPARE_PERSISTENT, &node->stmt, NULL);
+	if (rc != SQLITE_OK) {
+		sqlite3_free(node);
+		return rc;
+	}
+
+	node->in_use = 1;
+	node->next = vtab->cache_head;
+	vtab->cache_head = node;
+	*pNode = node;
+	DEBUG_LOG("Create node %p for vtab %p", node, vtab);
+	return SQLITE_OK;
+}
+
+/* Once we have finished with a statement, we release it back to the cache
+ * for reuse rather than finalizing it. Statements are reset and bindings
+ * cleared before releasing it.
+ */
+static void release_stmt(stmt_cache_node *node) {
+	DEBUG_LOG("Release node %p", node);
+	node->in_use = 0;
+	if (node->stmt) {
+		sqlite3_reset(node->stmt);
+		sqlite3_clear_bindings(node->stmt);
+	}
+}
+
+/* The external API to be used to clear all cached statements for
+ * a given DB connection
+ */
+
+void statementvtab_clear_cache(sqlite3 *db) {
+	DEBUG_LOG("Clearing all for conn %p", db);
+	statement_vtab* p = g_vtab_list;
+	while (p) {
+		if (p->db == db) clear_vtab_cache(p);
+		p = p->next_vtab;
+	}
+}
+
+#endif /* CACHE_STATEMENTS */
 
 static char* build_create_statement(sqlite3_stmt* stmt) {
 	sqlite3_str* sql = sqlite3_str_new(NULL);
@@ -56,6 +210,13 @@ static char* build_create_statement(sqlite3_stmt* stmt) {
 }
 
 static int statement_vtab_destroy(sqlite3_vtab* pVTab){
+#ifdef CACHE_STATEMENTS
+    /* Clear the cache for this vtab */
+	statement_vtab *vtab = (statement_vtab*)pVTab;
+	DEBUG_LOG("vtab_destroy");
+	clear_vtab_cache(vtab);
+	remove_vtab_from_global_list(vtab);
+#endif
 	sqlite3_free(((struct statement_vtab*)pVTab)->sql);
 	sqlite3_free(pVTab);
 	return SQLITE_OK;
@@ -77,6 +238,9 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 	int ret;
 	sqlite3_stmt* stmt = NULL;
 	char* create = NULL;
+#ifdef CACHE_STATEMENTS
+	stmt_cache_node *node = NULL;
+#endif
 
 	struct statement_vtab* vtab = sqlite3_malloc64(sizeof(*vtab));
 	if(!vtab)
@@ -91,8 +255,17 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 		goto error;
 	}
 
+#ifdef CACHE_STATEMENTS
+	/* Remember this vtab. And get a fresh prepared statement */
+	add_vtab_to_global_list(vtab);
+	if((ret = get_or_create_node(vtab, &node)) != SQLITE_OK)
+		goto sqlite_error;
+	stmt = node->stmt;
+#else
 	if((ret = sqlite3_prepare_v2(db,vtab->sql,vtab->sql_len,&stmt,NULL)) != SQLITE_OK)
 		goto sqlite_error;
+#endif
+	
 	if(!sqlite3_stmt_readonly(stmt)) {
 		ret = SQLITE_ERROR;
 		if(!(*pzErr = sqlite3_mprintf("Statement must be read only.")))
@@ -111,7 +284,12 @@ static int statement_vtab_create(sqlite3* db, void* pAux, int argc, const char* 
 		goto sqlite_error;
 
 	sqlite3_free(create);
+#ifdef CACHE_STATEMENTS
+	/* relese the statement back to the cache */
+	release_stmt(node);
+#else
 	sqlite3_finalize(stmt);
+#endif
 	return SQLITE_OK;
 
 sqlite_error:
@@ -119,7 +297,12 @@ sqlite_error:
 		ret = SQLITE_NOMEM;
 error:
 	sqlite3_free(create);
+#ifdef CACHE_STATEMENTS
+	/* mark node as unused. xDestroy will then clean eveything up */
+	release_stmt(node);
+#else
 	sqlite3_finalize(stmt);
+#endif
 	statement_vtab_destroy(*ppVtab);
 	*ppVtab = NULL;
 	return ret;
@@ -139,15 +322,30 @@ static int statement_vtab_open(sqlite3_vtab* pVTab, sqlite3_vtab_cursor** ppCurs
 	*ppCursor = &cur->base;
 	cur->stmt = NULL;
 	cur->param_argv = NULL;
+#ifdef CACHE_STATEMENTS
+	cur->node = NULL;
+#endif
+
 	if(vtab->num_inputs && !(cur->param_argv = sqlite3_malloc64(sizeof(*cur->param_argv)*vtab->num_inputs)))
 		return SQLITE_NOMEM;
 
+#ifdef CACHE_STATEMENTS
+	int rc;
+	if((rc = get_or_create_node(vtab, &cur->node)) == SQLITE_OK)
+		cur->stmt = cur->node->stmt;
+	return rc;
+#else
 	return sqlite3_prepare_v2(vtab->db,vtab->sql,vtab->sql_len,&cur->stmt,NULL);
+#endif
 }
 
 static int statement_vtab_close(sqlite3_vtab_cursor* cur){
 	struct statement_cursor* stmtcur = (struct statement_cursor*)cur;
+#ifdef CACHE_STATEMENTS
+	if (stmtcur->node) release_stmt(stmtcur->node);
+#else
 	sqlite3_finalize(stmtcur->stmt);
+#endif
 	sqlite3_free(stmtcur->param_argv);
 	sqlite3_free(cur);
 	return SQLITE_OK;

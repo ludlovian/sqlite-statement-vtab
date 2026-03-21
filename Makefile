@@ -11,7 +11,7 @@ endif
 src = $(name).c
 module = $(name).$(soext)
 
-.PHONY: all static install clean
+.PHONY: all static install clean test
 
 $(module): $(src)
 	$(CC) -fPIC -shared $(CFLAGS) -o $@ $^
@@ -26,6 +26,9 @@ static: $(name).a
 
 install: $(module)
 	install -m644 $^ $(PREFIX)/lib/
+
+test: $(module)
+	sqlite3 test.sql
 
 clean:
 	$(RM) $(module) $(name).a $(name).o

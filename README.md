@@ -2,6 +2,14 @@ SQLite module to define virtual tables and table-valued functions natively using
 
 statement_vtab is particularly handy as an interface for deriving multiple outputs from built-in or user-defined functions without the need to create a specialized module.
 
+Fork note: This version has been augmented with a re-usable cache of SQLite statements, rather than re-preparing the
+statement on each access of the virtual table. In order to clean the cache before you disconnect, there is an additional API
+
+`void statementvtab_clear_cache(sqlite3*);`
+
+Although if you close the connection using `sqlite3_close_v2` (rather than `sqlite3_close`) it *should* clean itself up. But
+it is good practice to clear the cache with the above call before disconnecting.
+
 # Example
 Example which dynamically creates a virtual table `split_date` that uses the built-in `strftime` function to extract year, month, and day from a date input into columns:
 ```SQL
