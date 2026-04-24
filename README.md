@@ -2,13 +2,35 @@ SQLite module to define virtual tables and table-valued functions natively using
 
 statement_vtab is particularly handy as an interface for deriving multiple outputs from built-in or user-defined functions without the need to create a specialized module.
 
-Fork note: This version has been augmented with a re-usable cache of SQLite statements, rather than re-preparing the
-statement on each access of the virtual table. In order to clean the cache before you disconnect, there is an additional API
+---
 
-`void statementvtab_clear_cache(sqlite3*);`
+# Fork
 
-Although if you close the connection using `sqlite3_close_v2` (rather than `sqlite3_close`) it *should* clean itself up. But
-it is good practice to clear the cache with the above call before disconnecting.
+**Fork note:** This version has been augmented with a re-usable cache of
+SQLite statements, rather than re-preparing the statement on each access of
+the virtual table. This is initially turned off, but can be turned on at
+runtime, either by a C API call, or an SQLite function.
+
+```c
+void statementvtab_enable_cache(sqlite3 *db, int bOnOff);`
+```
+
+```sql
+SELECT statement_enable_cache(NULL); -- returns the current setting
+SELECT statement_enable_cache(1);    -- turns cache ON
+```
+
+If caching is turned on, then prepared statements will be hanging around when
+you come to close the connection. This *might* work if you call
+`sqlite3_close_v2()` intead of `sqlite3_close()`, but it is good practice to
+turn caching off explicitly before closing the connection.
+
+The fork modifications are easily found by searching for `CACHE_STATEMENTS`
+in the code.
+
+The original README follows from here.
+
+---
 
 # Example
 Example which dynamically creates a virtual table `split_date` that uses the built-in `strftime` function to extract year, month, and day from a date input into columns:

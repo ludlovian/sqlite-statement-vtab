@@ -1,0 +1,58 @@
+.nullvalue NULL
+
+SELECT 10, 'Load';
+10|Load
+.load ./statement_vtab.so
+
+SELECT 20, 'Create';
+20|Create
+create virtual table vt1 using statement((
+  select  :num + 1  as a,
+          :str || 'x' as b
+  union all
+  select  :num + 2,
+          :str || 'y'
+));
+[STMT] connection_add_vtab
+[STMT] cache_entry_get: new node
+[STMT] cache_entry_get: prepare
+[STMT] cache_entry_release: finalize
+select 21, name from sqlite_schema where name='vt1';
+21|vt1
+
+SELECT 30, 'Simple select';
+30|Simple select
+SELECT 31, a, b from vt1 where num=7 and str='y';
+[STMT] cache_entry_get: prepare
+31|8|yx
+31|9|yy
+[STMT] cache_entry_release: finalize
+SELECT 32, a, b from vt1 where num=7 and a > 8;
+[STMT] cache_entry_get: prepare
+32|9|NULL
+[STMT] cache_entry_release: finalize
+SELECT 33, a, b from vt1 limit 1;
+[STMT] cache_entry_get: prepare
+33|NULL|NULL
+[STMT] cache_entry_release: finalize
+
+SELECT 40, 'Cache on';
+40|Cache on
+SELECT 41, statement_enable_cache(null);
+41|0
+SELECT 42, statement_enable_cache(1);
+42|1
+SELECT 43, * from vt1(7, 'y') as aa, vt1(17, 'z') as bb where aa.a=8 and bb.a=19;
+[STMT] cache_entry_get: prepare
+[STMT] cache_entry_get: new node
+[STMT] cache_entry_get: prepare
+43|8|yx|19|zy
+SELECT 44, * from vt1(7, 'y') as aa, vt1(17, 'z') as bb where aa.a=8 and bb.a=19;
+44|8|yx|19|zy
+SELECT 45, statement_enable_cache(0);
+[STMT] connection_clear_all_caches
+[STMT] vtab_clear_cache
+[STMT] vtab_clear_cache: finalize
+[STMT] vtab_clear_cache: finalize
+45|0
+[STMT] connection_remove_vtab
